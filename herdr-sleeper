@@ -1,0 +1,1553 @@
+#!/usr/bin/env python3
+"""herdr-sleeper plugin — sleep idle resumable agents in Herdr panes, wake them later.
+
+A Herdr plugin (v1 manifest) grown from the standalone `scripts/herdr-sleeper`
+reference implementation; the fail-closed safety rules are carried over
+unchanged, and the plugin adds what only a plugin can do:
+
+  * an in-process idle watcher (no launchd): started by the `startup` hook,
+    polled from `agent list`, idle clocked by `state_change_seq` movement —
+    no transcript mtime, so every agent kind with a session ref is eligible
+  * wake on focus (`pane.focused`), wake by pressing Enter in the pane (a
+    wake stub is left running there), and wake by command
+  * slept panes keep their sidebar row (`pane report-agent` claim) with a
+    `<kind> · sleeping` display label
+
+Exit path per agent kind: SIGTERM for claude and opencode (both shut down
+cleanly; a draft in the composer is discarded, never submitted — this is why
+the standalone script's composer-empty check only applies to kinds exited by
+typing into the composer), a typed command for anything else.
+
+Usage (normally via `herdr plugin action invoke djbclark.herdr-sleeper.*`):
+
+  herdr-sleeper startup                 ensure the watcher (idempotent)
+  herdr-sleeper sleep-pane [PANE]       manual sleep (context pane, or arg)
+  herdr-sleeper wake [PANE|NAME]        wake one / --all
+  herdr-sleeper list                    what is sleeping
+  herdr-sleeper log                     events, newest last
+  herdr-sleeper on-focus                pane.focused hook (internal)
+  herdr-sleeper stub PANE UUID          in-pane wake stub (internal)
+  herdr-sleeper scan                    one watcher tick, on demand
+
+Fail-closed rules, all inherited from the standalone script and its three
+review rounds plus the live-deployment iteration:
+
+1. Eligible only when: a supported agent kind with a session id (and, for
+   claude, an on-disk transcript — nothing to resume otherwise); Herdr
+   status idle/done; pane not focused; not excluded; session id not open in
+   another pane; idle for the configured window; original argv safely
+   replayable (`--fork-session`, `--print`, `--session-id`, positional
+   prompts, anything after `--`, options of unknown arity → refuse).
+2. Everything is re-checked after the journal write and immediately before
+   the exit, including that `state_change_seq` and the session id have not
+   moved; the exit targets the pane id, never the name; "exited" needs
+   Herdr to drop the agent *and* process-info to show no agent process —
+   unreadable process-info is unknown, not gone.
+3. The record is written *before* the exit. If the agent is still there
+   after the wait it stays `exit-requested`; the next tick reconciles
+   (dropped only after two consecutive sightings with a real process, or
+   when the pane runs a different session; `asleep` once verifiably gone;
+   `displaced` when our own wake put another session there — by hand only).
+   A record is never deleted because its pane vanished; the manual resume
+   command is printed instead.
+4. Wake refuses if the session id is live in any pane or any process that
+   selects it, when that cannot be verified, or when the pane's cwd or
+   terminal id no longer matches the record (recycled pane id). Recovered
+   argv goes through the same replay filter.
+5. A non-object state file, malformed config, unknown keys, booleans where
+   numbers go, conflicting env aliases, or a `nan`/negative/`inf` window
+   disables sleeping (logged every tick) — `wake`/`list`/`log` keep working.
+   A file lock serialises overlapping runs; the journal is re-read under it
+   before every write.
+
+Ideas adopted from the two community plugins studied before writing this
+(dalogax/herdr-agent-hibernate, prabhatgmp/herdr-park): the SIGTERM exit
+path, the seq-based idle clock, wake-on-focus with a per-pane wake lock,
+`terminal_id` as the pane identity that survives pane-id reuse, the sidebar
+claim, the in-pane Enter stub, and `notification show` with freed-MB
+reporting. What this plugin keeps that they do not: the journal state
+machine above, argv replay safety, session-live-elsewhere refusal on wake,
+config validation, and damaged-state quarantine.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+try:
+    import tomllib  # Python 3.11+
+except ImportError:  # herdr's plugin commands may run under the system python3 (3.9 here)
+    tomllib = None
+
+PLUGIN_ID = "djbclark.herdr-sleeper"
+SELF = Path(__file__).resolve()
+
+# ------------------------------------------------------------------ locations
+
+# Herdr injects the plugin env at runtime; the fallbacks keep manual runs and
+# the in-pane stub (which inherit no plugin env) pointed at the same files.
+STATE_ROOT = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR")
+                  or os.path.expanduser(f"~/.local/state/herdr/plugins/{PLUGIN_ID}"))
+CONFIG_DIR = Path(os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+                  or os.path.expanduser(f"~/.config/herdr/plugins/{PLUGIN_ID}"))
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or os.environ.get("HERDR_SLEEPER_HERDR_BIN") or "herdr"
+
+# Pane ids (w27:p1B) are unique only within one Herdr session; the legacy
+# standalone script served the default session. Named sessions get their own
+# journal and watcher; the default session keeps the root, like the legacy
+# layout so migration is a rename-free copy.
+SESSION = os.environ.get("HERDR_SESSION") or "default"
+SESSION_DIR_NAME = "" if SESSION == "default" else "sessions/" + re.sub(r"[^\w.-]", "_", SESSION)
+STATE_DIR = STATE_ROOT / SESSION_DIR_NAME
+JOURNAL = STATE_DIR / "sleeping.json"          # pane -> entry, the source of truth
+SNAPSHOT = STATE_DIR / "panes.json"            # crash-recovery pane->uuid->argv merge
+EVENTS = STATE_DIR / "events.jsonl"
+LOGFILE = STATE_DIR / "sleeper.log"
+LOCK = STATE_DIR / "lock"
+WATCHER_PID = STATE_DIR / "watcher.pid"
+
+LEGACY_STATE_DIR = Path(os.environ.get("HERDR_SLEEPER_STATE")
+                        or os.path.expanduser("~/.local/state/herdr-sleeper"))
+TRANSCRIPTS = Path(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")) / "projects"
+
+SLEEP_MARK = "💤 "
+MODE_RESET = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h"
+PROMPT_GLYPHS = ("❯",)  # Claude Code's composer glyph; a bare ">" is too generic to vouch for
+FOOTER_PREFIXES = ("◤ graft", "▸ ctx", "⏵⏵", "? for shortcuts")
+HERDR_TIMEOUT = 30.0
+EXIT_WAIT_SECONDS = 25
+WAKE_TIMEOUT_MS = 60_000
+WATCHER_POLL_SECONDS_DEFAULT = 60
+WATCHER_MAX_FAILURES = 10
+CLAIM_SOURCE = "custom:herdr-sleeper"
+CLAIM_AGENT = "sleeper"
+
+DEFAULTS = {
+    "idle_hours": 12.0,          # the operator's choice; anything from minutes to days is valid
+    "agents": ["claude", "opencode"],
+    "exclude": [],
+    "poll_seconds": WATCHER_POLL_SECONDS_DEFAULT,
+    "notify": True,
+    "wake_on_focus": True,
+}
+
+
+class SleeperError(Exception):
+    """Any refusal with a reason a human can act on."""
+
+
+class ConfigError(SleeperError):
+    """The configuration is unusable; sleeping stays off until it is fixed."""
+
+
+class DamagedState(SleeperError):
+    """The file exists but is not a JSON object — as opposed to an I/O failure reading it."""
+
+
+# ------------------------------------------------------------- agent profiles
+
+# exit: "signal" sends SIGTERM to the agent process (claude/opencode shut down
+# cleanly and discard composer drafts); "prompt" types exit_command into the
+# pane, which is only safe with the composer-empty check (recheck applies it).
+# argv_after_binary: replay the pane's original argv on wake (claude only —
+# for the others the resume flags carry everything we can vouch for).
+PROFILES: dict[str, dict] = {
+    "claude": {"exit": "signal", "argv_after_binary": True},
+    "opencode": {"exit": "signal", "argv_after_binary": False},
+    # codex is deliberately absent: its TUI does not restore the terminal's keyboard protocol on
+    # any signal, so it would need the typed-command exit, and our composer-empty check is
+    # claude-shaped (prompt glyphs) — an unknown composer must refuse, which would make a codex
+    # profile refuse always. Add it only with its own composer check.
+}
+
+
+def resume_argv(kind: str, uuid: str, extra: list[str] | None = None) -> list[str] | None:
+    """The argv after the agent binary that resumes exactly this session."""
+    if kind == "claude":
+        return [*(extra or []), "--resume", uuid]
+    if kind == "opencode":
+        return ["-s", uuid]
+    if kind == "codex":
+        return ["resume", uuid]
+    return None
+
+
+def manual_command(entry: dict) -> str:
+    """The by-hand resume line printed when we refuse to act automatically."""
+    kind = entry.get("kind") or "claude"
+    extra: list[str] = []
+    if kind == "claude":
+        extra, _why = replayable_argv(entry.get("argv") or [])
+    argv = resume_argv(kind, entry["uuid"], extra or None)
+    if argv is None:
+        return f"(no resume recipe for {kind}; session {entry['uuid']})"
+    return f"cd {shlex.quote(entry.get('cwd') or '.')} && " + shlex.join([kind, *argv])
+
+
+# -------------------------------------------------------------------- output
+
+def say(msg: str) -> None:
+    """Diagnostics: to the log always, to the caller's stdout too."""
+    line = f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with LOGFILE.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    print(msg, file=sys.stderr)
+
+
+def event(what: str, **fields: object) -> None:
+    """Append one structured record to events.jsonl (what `log` shows)."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {"at": dt.datetime.now().isoformat(timespec="seconds"), "event": what, **fields}
+        with EVENTS.open("a") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError as exc:
+        say(f"WARN could not write event: {exc}")
+
+
+def notify(title: str, body: str = "", enabled: bool = True) -> None:
+    if not enabled:
+        return
+    herdr("notification", "show", title, *(["--body", body] if body else []), check=False, timeout=10)
+
+
+# ---------------------------------------------------------------- json state
+
+def write_json(path: Path, data: object) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def quarantine(path: Path) -> Path:
+    """Move a damaged state file aside (never overwrite evidence) and return where it went."""
+    aside = path.with_name(f"{path.name}.damaged-{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}")
+    os.replace(path, aside)
+    return aside
+
+
+def read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise SleeperError(f"{path} could not be read ({exc}); refusing to act without it")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise DamagedState(f"{path} is not valid JSON ({exc}); refusing to act on a damaged state file")
+    if not isinstance(data, dict):
+        raise DamagedState(f"{path} does not hold a JSON object; refusing to act on a damaged state file")
+    return data
+
+
+class locked:
+    """Interprocess lock around a whole sleep/wake transaction (watcher + hooks may overlap)."""
+
+    def __enter__(self) -> "locked":
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.fh = LOCK.open("a+")
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            say("another herdr-sleeper holds the lock; waiting")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+# --------------------------------------------------------------- herdr calls
+
+def herdr(*args: str, check: bool = True, timeout: float = HERDR_TIMEOUT) -> dict:
+    """Run a `herdr` CLI command and return its parsed JSON `result`.
+
+    Herdr prints `{"error": {...}}` with exit 0 on failure, so the envelope is
+    what we trust, not the exit code. With check=False a failure returns {}.
+    """
+    try:
+        proc = subprocess.run([HERDR_BIN, *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if check:
+            raise SleeperError(f"herdr {' '.join(args[:2])} timed out after {timeout}s")
+        return {}
+    except FileNotFoundError:
+        raise SleeperError(f"`{HERDR_BIN}` not found (set HERDR_BIN_PATH or fix PATH)")
+    out = proc.stdout.strip()
+    payload: dict | None = None
+    if out.startswith("{"):
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError:
+            payload = None
+    if payload is None or "error" in payload or proc.returncode != 0:
+        if check:
+            detail = (payload or {}).get("error") or proc.stderr.strip() or out[:200] or f"exit {proc.returncode}"
+            raise SleeperError(f"herdr {' '.join(args[:2])} failed: {detail}")
+        return {}
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        if check:
+            raise SleeperError(f"herdr {' '.join(args[:2])}: malformed envelope (result is {type(result).__name__})")
+        return {}
+    return result
+
+
+def herdr_screen(pane: str) -> str | None:
+    """The pane's screen as plain text, or None when it could not be read."""
+    try:
+        proc = subprocess.run([HERDR_BIN, "pane", "read", pane], capture_output=True, text=True, timeout=HERDR_TIMEOUT)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if proc.returncode != 0 or proc.stdout.lstrip().startswith('{"error"'):
+        return None
+    return proc.stdout
+
+
+def list_agents() -> list[dict]:
+    agents = herdr("agent", "list").get("agents")
+    if not isinstance(agents, list) or not all(isinstance(a, dict) and isinstance(a.get("pane_id"), str) for a in agents):
+        raise SleeperError("herdr agent list: malformed agents payload")
+    return agents
+
+
+def valid_entry(entry: object) -> bool:
+    """A journal/snapshot entry we are willing to act on."""
+    return (isinstance(entry, dict) and isinstance(entry.get("pane_id"), str)
+            and isinstance(entry.get("uuid"), str) and isinstance(entry.get("kind"), str))
+
+
+# -------------------------------------------------------------------- config
+
+def parse_duration(text: str) -> float:
+    """'12h', '90m', '1d', '1.5h', or a bare number of hours → hours."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*", str(text))
+    if not m:
+        raise ConfigError(f"bad duration {text!r}; use e.g. 12h, 90m, 1d")
+    n, unit = float(m.group(1)), m.group(2) or "h"
+    return n * {"s": 1 / 3600, "m": 1 / 60, "h": 1.0, "d": 24.0}[unit]
+
+
+def _toml_subset(path: Path) -> dict:
+    """Parse the small TOML subset the config uses, for interpreters without tomllib.
+
+    Understands `key = value` with a quoted string, number, boolean, or list of
+    quoted strings; `#` comments; blank lines. Anything else raises ConfigError —
+    a config we cannot fully parse must disable sleeping, not half-apply.
+    """
+    out: dict = {}
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        m = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(.+)", line)
+        if not m:
+            raise ConfigError(f"line {n}: not `key = value`")
+        key, raw = m.group(1), m.group(2).strip()
+        if raw.startswith("["):
+            items = [x.strip() for x in raw[1:-1].split(",")] if raw[1:-1].strip() else []
+            if not raw.endswith("]") or not all(x.startswith('"') and x.endswith('"') and len(x) >= 2 for x in items):
+                raise ConfigError(f"line {n}: only lists of quoted strings are supported")
+            out[key] = [x[1:-1] for x in items]
+        elif raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            out[key] = raw[1:-1]
+        elif raw in ("true", "false"):
+            out[key] = raw == "true"
+        else:
+            try:
+                out[key] = int(raw) if re.fullmatch(r"-?\d+", raw) else float(raw)
+            except ValueError:
+                raise ConfigError(f"line {n}: unsupported value {raw!r}")
+    return out
+
+
+def load_config() -> tuple[dict, dict[str, str]]:
+    """Effective settings and, per key, where each value came from. Raises ConfigError."""
+    values = dict(DEFAULTS)
+    source = {k: "default" for k in DEFAULTS}
+    if CONFIG_FILE.exists():
+        try:
+            raw = tomllib.loads(CONFIG_FILE.read_text()) if tomllib else _toml_subset(CONFIG_FILE)
+        except Exception as exc:  # TOMLDecodeError, OSError, or the subset parser's ConfigError
+            raise ConfigError(f"{CONFIG_FILE}: {exc}")
+        for k, v in raw.items():
+            if k == "idle":
+                values["idle_hours"], source["idle_hours"] = parse_duration(v), str(CONFIG_FILE)
+            elif k in DEFAULTS:
+                values[k], source[k] = v, str(CONFIG_FILE)
+            else:
+                raise ConfigError(f"{CONFIG_FILE}: unknown key {k!r}")
+    env = {"idle_hours": "HERDR_SLEEPER_IDLE_HOURS", "idle": "HERDR_SLEEPER_IDLE", "exclude": "HERDR_SLEEPER_EXCLUDE",
+           "agents": "HERDR_SLEEPER_AGENTS", "poll_seconds": "HERDR_SLEEPER_POLL_SECONDS",
+           "notify": "HERDR_SLEEPER_NOTIFY", "wake_on_focus": "HERDR_SLEEPER_WAKE_ON_FOCUS"}
+    if "HERDR_SLEEPER_IDLE" in os.environ and "HERDR_SLEEPER_IDLE_HOURS" in os.environ:
+        raise ConfigError("set only one of HERDR_SLEEPER_IDLE and HERDR_SLEEPER_IDLE_HOURS")
+    for k, var in env.items():
+        if var in os.environ:
+            raw_v = os.environ[var]
+            key = "idle_hours" if k == "idle" else k
+            values[key] = (raw_v.split() if k in ("exclude", "agents")
+                           else parse_duration(raw_v) if key == "idle_hours"
+                           else raw_v)
+            source[key] = f"${var}"
+    # validation: a bad config must never mean "no excludes" or "sleep everything"
+    for key in ("idle_hours", "poll_seconds"):
+        if isinstance(values[key], bool):  # TOML `false` would otherwise become 0.0 = sleep everything
+            raise ConfigError(f"{key} must be a number, not a boolean")
+    try:
+        values["idle_hours"] = float(values["idle_hours"])
+        values["poll_seconds"] = float(values["poll_seconds"])
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"idle_hours/poll_seconds must be numbers: {exc}")
+    if not math.isfinite(values["idle_hours"]) or values["idle_hours"] < 0:
+        raise ConfigError(f"idle_hours must be a finite number >= 0, got {values['idle_hours']!r}")
+    if not (1 <= values["poll_seconds"] <= 3600):
+        raise ConfigError("poll_seconds must be within 1..3600")
+    for key in ("exclude", "agents"):
+        v = values[key]
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise ConfigError(f"{key} must be a list of strings")
+        values[key] = v
+    unknown = [a for a in values["agents"] if a not in PROFILES]
+    if unknown:
+        raise ConfigError(f"agents has unsupported kind(s) {unknown}; known: {sorted(PROFILES)}")
+    for key in ("notify", "wake_on_focus"):
+        if not isinstance(values[key], bool):
+            raise ConfigError(f"{key} must be a boolean")
+    return values, source
+
+
+# ---------------------------------------------------------------- inspection
+
+def transcript_for(uuid: str) -> Path | None:
+    """The transcript for a claude session; when several match, the most recently written one."""
+    hits = [Path(p) for p in glob.glob(str(TRANSCRIPTS / "*" / f"{uuid}.jsonl"))]
+    if not hits:
+        return None
+    try:
+        return max(hits, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return None
+
+
+def agent_process(pane: str, kind: str) -> tuple[bool | None, list[str] | None, int | None]:
+    """(present, argv_after_argv0, pid) for the agent process controlling the pane.
+
+    present is True/False when process-info answered, None when it could not
+    be read — an unknown must never be mistaken for "gone".
+    """
+    info = herdr("pane", "process-info", "--pane", pane, check=False).get("process_info")
+    if not isinstance(info, dict) or not isinstance(info.get("foreground_processes"), list):
+        return None, None, None
+    for proc in info["foreground_processes"]:
+        argv = proc.get("argv") or []
+        if not argv:
+            continue
+        base = os.path.basename(str(argv[0]))
+        if base == kind or proc.get("name") == kind or base == "node" and any(
+                str(p).endswith(f"{kind}-code/cli.js") or str(p).endswith(f"{kind}/cli.js") for p in argv[1:3]):
+            return True, [str(a) for a in argv[1:]], proc.get("pid")
+    return False, None, None
+
+
+def stub_running(pane: str) -> bool:
+    """Is our in-pane wake stub the pane's foreground process?
+
+    The stub appears as `<python> /path/to/herdr-sleeper stub <pane> <uuid>`
+    (a child of the pane's shell — never exec'd over the shell itself).
+    """
+    info = herdr("pane", "process-info", "--pane", pane, check=False).get("process_info")
+    if not isinstance(info, dict) or not isinstance(info.get("foreground_processes"), list):
+        return False
+    for proc in info["foreground_processes"]:
+        argv = [str(a) for a in (proc.get("argv") or [proc.get("argv0") or ""])]
+        if not argv:
+            continue
+        is_us = any(os.path.basename(a) == "herdr-sleeper" for a in argv[:3])
+        if is_us and "stub" in argv[1:4]:
+            return True
+    return False
+
+
+def rss_mb(pane: str) -> int:
+    """Resident memory of the pane's foreground job (the agent plus what it spawned)."""
+    info = herdr("pane", "process-info", "--pane", pane, check=False).get("process_info")
+    pids = [str(p.get("pid")) for p in (info or {}).get("foreground_processes", []) if p.get("pid")]
+    if not pids:
+        return 0
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(pids)], capture_output=True, text=True, timeout=10).stdout
+        return sum(int(x) for x in out.split() if x.isdigit()) // 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+REFUSED_OPTIONS = {"--fork-session", "--print", "--session-id", "--new", "--replay", "-p"}
+BOOLEAN_OPTIONS = {"--dangerously-skip-permissions", "--verbose", "--debug", "-d"}
+VALUE_OPTIONS = {"--model", "--permission-prompt-tool", "--add-dir", "--setting-source", "--env"}
+
+
+def replayable_argv(args: list[str]) -> tuple[list[str] | None, str | None]:
+    """Strip session-selection flags; refuse argv that would fork the session or re-run work.
+
+    Returns (argv_to_replay, refusal_reason). Claude-specific: only used for
+    kinds whose profile replays the original argv.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return None, "argv contains `--` (positional input would be replayed)"
+        if a in REFUSED_OPTIONS or a.split("=", 1)[0] in REFUSED_OPTIONS:
+            return None, f"argv contains {a} (not safely replayable)"
+        if a in ("--resume", "-r"):
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                i += 1  # drop its value too
+            i += 1
+            continue
+        if a.startswith("--resume=") or a in ("--continue", "-c"):
+            i += 1
+            continue
+        if a in BOOLEAN_OPTIONS:
+            out.append(a)
+            i += 1
+            continue
+        base = a.split("=", 1)[0]
+        if base in VALUE_OPTIONS:
+            out.append(a)
+            if "=" not in a:
+                if i + 1 >= len(args):
+                    return None, f"{a} is missing its value"
+                out.append(args[i + 1])
+                i += 1
+            i += 1
+            continue
+        if a.startswith("-"):
+            # an option we do not know the arity of: guessing could turn a prompt into a "value" and replay it
+            return None, f"argv has unrecognised option {a} (add it to VALUE_OPTIONS/BOOLEAN_OPTIONS if it is safe)"
+        return None, f"argv has positional input {a!r} (an initial prompt would be re-sent on wake)"
+    return out, None
+
+
+def composer_state(screen: str | None) -> tuple[str, str]:
+    """('empty' | 'draft' | 'unknown', detail) judged from the pane screen, failing closed.
+
+    Only consulted for kinds exited by typing into the composer (a signal exit
+    discards drafts instead of submitting them). The composer is the last line
+    starting with a prompt glyph; text after it, or any non-footer line below
+    it, is a draft. No glyph at all, or no screen, is unknown — refuse.
+    """
+    if screen is None:
+        return "unknown", "screen unreadable"
+    lines = [ln.rstrip() for ln in screen.splitlines() if ln.strip()]
+    for idx in range(len(lines) - 1, -1, -1):
+        stripped = lines[idx].lstrip()
+        if stripped.startswith(PROMPT_GLYPHS):
+            draft = stripped[1:].strip()
+            if draft:
+                return "draft", draft[:60]
+            rest = [ln.strip() for ln in lines[idx + 1:]]
+            below = [ln for ln in rest if not (ln.startswith(FOOTER_PREFIXES) or set(ln) <= {"─"})]
+            if below:
+                return "draft", below[0][:60]
+            if not rest:  # a bare glyph with nothing rendered under it is not a composer we can vouch for
+                return "unknown", "no footer below the prompt"
+            return "empty", ""
+        if stripped.startswith(("⏺", "✻", "⎿")):
+            return "unknown", "composer not visible below transcript"
+    return "unknown", "no prompt glyph on screen"
+
+
+def uuid_live_elsewhere(uuid: str, except_pane: str | None = None, cwd: str | None = None) -> str | None:
+    """Where this session is already running ('pane w1:p2', 'pid 123'); None if verified nowhere.
+
+    Raises SleeperError when that cannot be verified — an unknown answer must
+    not authorise a resume, which would fork the session.
+    """
+    try:
+        agents = list_agents()
+    except SleeperError as exc:
+        raise SleeperError(f"cannot verify session liveness: {exc}")
+    for a in agents:
+        if a["pane_id"] != except_pane and (a.get("agent_session") or {}).get("value") == uuid:
+            return f"pane {a['pane_id']}"
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=15, check=True).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SleeperError(f"cannot verify session liveness: ps failed ({exc})")
+    for line in ps.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        # a shell whose command text merely mentions the uuid is not a session; anything else that
+        # selects the uuid on its command line (claude, node …/claude, node …/cli.js) is treated as one
+        if os.path.basename(parts[1]) in ("bash", "sh", "zsh", "fish", "dash", "login"):
+            continue
+        if "herdr-sleeper" in line and " stub " in f" {line} ":
+            continue  # our own in-pane wake stub carries the uuid as an argument; it is not a session
+        selects = any(p == uuid or p.endswith("=" + uuid) for p in parts[2:])
+        if selects:
+            return f"pid {parts[0]}"
+        if not any(os.path.basename(p) == "claude" or p.endswith("claude-code/cli.js") for p in parts[1:3]):
+            continue
+        # `claude --continue` picks up the newest session in its cwd, which may be this one
+        if cwd and any(p in ("--continue", "-c") for p in parts[2:]):
+            where = process_cwd(parts[0])
+            if where is None:
+                raise SleeperError(f"cannot verify session liveness: pid {parts[0]} runs `claude --continue` "
+                                   "and its cwd could not be inspected (lsof)")
+            if where == cwd:
+                return f"pid {parts[0]} (claude --continue in {cwd})"
+    return None
+
+
+def process_cwd(pid: str) -> str | None:
+    """The process's cwd via lsof, or None when that could not be established (callers treat None as unknown)."""
+    try:
+        proc = subprocess.run(["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return line[1:]
+    return None
+
+
+def merge_snapshot(agents: list[dict]) -> None:
+    """pane→uuid→argv for every supported pane, merged so that panes currently asleep keep their handle."""
+    snap = read_json(SNAPSHOT)
+    live_panes = {a["pane_id"] for a in agents}
+    for a in agents:
+        kind = a.get("agent")
+        if kind not in PROFILES:
+            continue
+        uuid = (a.get("agent_session") or {}).get("value")
+        if not uuid:
+            continue
+        present, argv, _pid = agent_process(a["pane_id"], kind)
+        prior = snap.get(a["pane_id"]) or {}
+        if argv is None and present is None and prior.get("uuid") == uuid:
+            argv = prior.get("argv")  # process-info hiccup: keep what we knew rather than erase it
+        snap[a["pane_id"]] = {
+            "kind": kind, "uuid": uuid, "name": a.get("name"), "cwd": a.get("cwd"),
+            "title": a.get("terminal_title_stripped"), "argv": argv,
+            "terminal_id": a.get("terminal_id"),
+            "seen_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+    for pane in list(snap):  # a pane now running a *different* session is no longer recoverable to the old one
+        if pane in live_panes and snap[pane]["uuid"] not in {
+            (a.get("agent_session") or {}).get("value") for a in agents if a["pane_id"] == pane
+        }:
+            snap.pop(pane)
+    write_json(SNAPSHOT, snap)
+
+
+def wake_name(entry: dict) -> str:
+    return entry.get("name") or "wake-" + entry["pane_id"].replace(":", "-")
+
+
+# --------------------------------------------------------------- assessment
+
+SLEEPABLE_STATUSES = {"idle", "done"}
+
+
+def assess(agent: dict, all_agents: list[dict], idle_hours: float, journal: dict,
+           exclude: set[str] | None = None, idle_since: float | None = None) -> tuple[bool, str, float | None]:
+    """Decide whether one agent may be slept. Returns (ok, reason, idle_hours).
+
+    The idle clock itself lives in the watcher (seq movement); `idle_since`
+    is the watcher's monotonic timestamp for this pane's current idle
+    stretch. Manual `sleep-pane` passes idle_since=None to skip the window.
+    """
+    pane = agent["pane_id"]
+    kind = agent.get("agent")
+    if exclude and (pane in exclude or agent.get("name") in exclude):
+        return False, "excluded", None
+    if pane in journal:
+        return False, f"already in sleep journal ({journal[pane].get('phase', 'asleep')})", None
+    if kind not in PROFILES:
+        return False, f"agent kind {kind!r} not supported", None
+    uuid = (agent.get("agent_session") or {}).get("value")
+    if not uuid:
+        return False, "no session uuid (cannot resume)", None
+    if agent.get("focused") is not False:  # missing/None must not read as "not focused"
+        return False, "pane is focused (or focus unknown)", None
+    status = agent.get("agent_status")
+    if status not in SLEEPABLE_STATUSES:
+        return False, f"status {status}", None
+    others = [a for a in all_agents if a["pane_id"] != pane and (a.get("agent_session") or {}).get("value") == uuid]
+    if others:
+        return False, f"session also open in {', '.join(a['pane_id'] for a in others)}", None
+    if kind == "claude" and transcript_for(uuid) is None:
+        return False, "no transcript on disk (nothing to resume)", None
+    if idle_since is not None:
+        idle = (time.monotonic() - idle_since) / 3600
+        if idle < idle_hours:
+            return False, f"idle {idle:.1f}h < {idle_hours:g}h", idle
+        return True, f"idle {idle:.1f}h", idle
+    return True, "manual", None
+
+
+def recheck(agent: dict, idle_hours: float, journal: dict, exclude: set[str],
+            idle_since: float | None = None) -> tuple[str | None, dict | None]:
+    """Re-run every check against live state right before acting. Returns (reason_to_stop, live_agent)."""
+    fresh = {a["pane_id"]: a for a in list_agents() if a.get("agent")}
+    now = fresh.get(agent["pane_id"])
+    if now is None:
+        return "agent gone", None
+    if now.get("state_change_seq") != agent.get("state_change_seq"):
+        return f"state changed since scan ({agent.get('agent_status')} → {now.get('agent_status')})", now
+    if (now.get("agent_session") or {}).get("value") != (agent.get("agent_session") or {}).get("value"):
+        return "session changed since scan", now
+    ok, reason, _ = assess(now, list(fresh.values()), idle_hours, journal, exclude, idle_since)
+    if not ok:
+        return reason, now
+    if PROFILES.get(now.get("agent"), {}).get("exit") == "prompt":
+        state, detail = composer_state(herdr_screen(agent["pane_id"]))
+        if state != "empty":
+            return f"composer {state}: {detail}", now
+    return None, now
+
+
+# ----------------------------------------------------------------- sidebar
+
+def claim(pane: str, kind: str) -> bool:
+    """Keep the slept pane's sidebar row: report a placeholder agent we own. Best effort."""
+    with contextlib.suppress(SleeperError):
+        herdr("pane", "report-agent", pane, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT,
+              "--state", "unknown", check=False)
+        herdr("pane", "report-metadata", pane, "--source", "herdr-sleeper",
+              "--display-agent", f"{kind} · sleeping", check=False)
+        return herdr("pane", "get", pane, check=False).get("pane", {}).get("agent") == CLAIM_AGENT
+    return False
+
+
+def release(pane: str) -> None:
+    """Drop the claim; must precede any agent start in the pane (a stale claim outranks detection)."""
+    with contextlib.suppress(SleeperError):
+        herdr("pane", "release-agent", pane, "--source", CLAIM_SOURCE, "--agent", CLAIM_AGENT, check=False)
+        herdr("pane", "report-metadata", pane, "--source", "herdr-sleeper",
+              "--clear-display-agent", check=False)
+
+
+def claimed(entry: dict, pane_info: dict | None) -> bool:
+    """Is this pane's reported agent our own placeholder?"""
+    return bool(pane_info) and pane_info.get("agent") == CLAIM_AGENT
+
+
+# -------------------------------------------------------------------- sleep
+
+def sleep_agent(agent: dict, idle_hours: float, exclude: set[str], dry_run: bool,
+                idle_since: float | None = None, allow_focused: bool = False,
+                notify_enabled: bool = True) -> tuple[bool, str]:
+    """Try to sleep one agent. Returns (slept, outcome). Caller holds the lock."""
+    pane = agent["pane_id"]
+    kind = agent["agent"]
+    profile = PROFILES[kind]
+    uuid = agent["agent_session"]["value"]
+    if allow_focused:  # an explicit request may sleep the focused pane; it still has to be idle
+        agent = {**agent, "focused": False}
+
+    replay: list[str] = []
+    if profile["argv_after_binary"]:
+        _present, raw_argv, _pid = agent_process(pane, kind)
+        if raw_argv is None:
+            return False, "could not read agent argv from pane"
+        replay, why = replayable_argv(raw_argv)
+        if replay is None:
+            return False, why or "argv not replayable"
+
+    journal = read_json(JOURNAL)
+    if dry_run:
+        stop, _ = recheck(agent, idle_hours, journal, exclude, idle_since)
+        if stop:
+            event("refused", pane=pane, name=agent.get("name"), uuid=uuid, reason=stop)
+            return False, f"refused: {stop}"
+        return False, "would sleep (dry run)"
+
+    pane_info = herdr("pane", "get", pane).get("pane", {})
+    label = pane_info.get("label") or None
+    if label and label.startswith(SLEEP_MARK):
+        label = label[len(SLEEP_MARK):] or None
+    freed_mb = rss_mb(pane)
+    entry = {
+        "pane_id": pane, "workspace_id": agent.get("workspace_id"), "tab_id": agent.get("tab_id"),
+        "terminal_id": agent.get("terminal_id") or pane_info.get("terminal_id"),
+        "name": agent.get("name"), "label": label, "title": agent.get("terminal_title_stripped"),
+        "cwd": agent.get("cwd"), "uuid": uuid, "kind": kind,
+        "argv": replay or None, "slept_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "phase": "exit-requested",
+    }
+    name = wake_name(entry)
+
+    # 1. journal first, under the lock, re-read: if anything below fails the handle still exists.
+    journal = read_json(JOURNAL)
+    journal[pane] = entry
+    write_json(JOURNAL, journal)
+
+    # 2. the last look before acting — after the journal write, so nothing happens between
+    #    check and act but the exit itself. Targets the pane id: names can be renamed under us.
+    stop, _ = recheck(agent, idle_hours, {k: v for k, v in journal.items() if k != pane}, exclude, idle_since)
+    if stop:
+        journal = read_json(JOURNAL)
+        journal.pop(pane, None)
+        write_json(JOURNAL, journal)
+        event("refused", pane=pane, name=name, uuid=uuid, reason=stop)
+        return False, f"refused: {stop}"
+
+    # 3. the exit itself. A signal discards composer drafts instead of submitting them;
+    #    a typed command is only used for kinds whose composer we positively verified empty.
+    how = "signal"
+    if profile["exit"] == "signal":
+        present, _argv, pid = agent_process(pane, kind)
+        if present is not True or not pid:
+            journal = read_json(JOURNAL)
+            journal.pop(pane, None)
+            write_json(JOURNAL, journal)
+            event("refused", pane=pane, name=name, uuid=uuid, reason="agent process not identifiable for signal")
+            return False, "refused: agent process not identifiable for signal"
+        freed_mb = freed_mb or rss_mb(pane)
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (OSError, ValueError) as exc:
+            journal = read_json(JOURNAL)
+            journal.pop(pane, None)
+            write_json(JOURNAL, journal)
+            event("refused", pane=pane, name=name, uuid=uuid, reason=f"signal failed: {exc}")
+            return False, f"refused: signal failed: {exc}"
+        how = f"SIGTERM to pid {pid}"
+    else:
+        herdr("agent", "prompt", pane, profile["exit_command"], check=False)
+        how = f"typed {profile['exit_command']!r}"
+
+    # 4. "gone" needs positive evidence: Herdr no longer lists the agent AND no agent process.
+    deadline = time.monotonic() + EXIT_WAIT_SECONDS
+    gone = False
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        pane_now = herdr("pane", "get", pane, check=False).get("pane")
+        present, _argv, _pid = agent_process(pane, kind)
+        if isinstance(pane_now, dict) and "agent" not in pane_now and present is False:
+            gone = True
+            break
+    if not gone:
+        # A timeout is not proof the exit failed; keep the handle and let the next tick reconcile.
+        say(f"WARN {pane}: agent still present {EXIT_WAIT_SECONDS}s after exit; entry kept as exit-requested")
+        event("exit-uncertain", pane=pane, name=name, uuid=uuid)
+        return False, "exit uncertain; will reconcile next tick"
+
+    journal = read_json(JOURNAL)
+    if pane in journal:
+        journal[pane]["phase"] = "asleep"
+        write_json(JOURNAL, journal)
+
+    # 5. reset terminal modes, claim the sidebar row, leave the Enter-stub, mark the label, notify.
+    #    The stub runs as a child of the pane's shell (no `exec` — the shell must survive beneath
+    #    it, or the pane would close when the woken agent exits). The pane shell has none of the
+    #    plugin env, so the typed command carries the stub's own routing: the session's socket
+    #    path, the session name, and the state dir holding this journal.
+    stub_env = ""
+    for var in ("HERDR_SOCKET_PATH", "HERDR_CLIENT_SOCKET_PATH"):
+        val = os.environ.get(var)
+        if val:
+            stub_env += f"{var}={shlex.quote(val)} "
+    stub_env += f"HERDR_SESSION={shlex.quote(SESSION)} "
+    herdr("pane", "run", pane,
+          f"printf '{MODE_RESET}'; clear; printf '%s\\n' {shlex.quote(SLEEP_MARK + 'slept by herdr-sleeper ' + entry['slept_at'])}; "
+          f"{stub_env}{shlex.join([str(SELF), 'stub', pane, uuid, str(STATE_DIR)])}",
+          check=False)
+    herdr("pane", "rename", pane, SLEEP_MARK + (label or entry["title"] or name), check=False)
+    time.sleep(2)  # herdr takes ~2s to drop the exited agent's session; the claim is ignored before that
+    claim(pane, kind)
+    event("slept", pane=pane, name=name, uuid=uuid, kind=kind, title=entry["title"], cwd=entry["cwd"],
+          freed_mb=freed_mb or None, how=how)
+    notify(f"{SLEEP_MARK}slept {name}", f"freed ~{freed_mb} MB · wake: focus the pane, press Enter, or "
+            f"{shlex.join([str(SELF), 'wake', name])}", enabled=notify_enabled)
+    return True, "slept"
+
+
+# ------------------------------------------------------------------- stub
+
+def cmd_stub(pane: str, uuid: str, state_dir: str | None = None) -> int:
+    """The in-pane wake stub: waits for Enter, then execs the agent back into its session.
+
+    Runs inside the pane's shell with none of the plugin env; the sleep side
+    therefore types the routing (socket, session, state dir) into the command
+    line itself. Ctrl-C or EOF leaves a plain shell and prints the manual
+    resume command.
+    """
+    global HERDR_BIN, STATE_DIR, JOURNAL, SNAPSHOT, EVENTS, LOGFILE, LOCK, WATCHER_PID
+    HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    if state_dir:
+        STATE_DIR = Path(state_dir)
+        JOURNAL, SNAPSHOT, EVENTS = STATE_DIR / "sleeping.json", STATE_DIR / "panes.json", STATE_DIR / "events.jsonl"
+        LOGFILE, LOCK, WATCHER_PID = STATE_DIR / "sleeper.log", STATE_DIR / "lock", STATE_DIR / "watcher.pid"
+    journal = read_json(JOURNAL)
+    entry = journal.get(pane) or {}
+    if entry.get("uuid") != uuid:
+        print(f"herdr-sleeper: no journal entry for {uuid} in {pane}; type `exit` or start an agent by hand")
+        return 0
+    name = wake_name(entry)
+    print(f"\n  {SLEEP_MARK}{entry.get('title') or name} — slept {entry.get('slept_at', '?')}")
+    print(f"  press Enter to resume (ctrl-c leaves a plain shell)\n")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        release(pane)
+        print(f"left as a shell; resume with: {manual_command(entry)}")
+        return 0
+    # the same fail-closed checks as any other wake, then exec in place
+    where = uuid_live_elsewhere(uuid, except_pane=pane, cwd=entry.get("cwd"))
+    if where:
+        print(f"herdr-sleeper: session is already live in {where}; left as a shell.\n"
+              f"  manual: {manual_command(entry)}")
+        return 0
+    if entry.get("cwd") and os.path.realpath(os.getcwd()) != os.path.realpath(entry["cwd"]):
+        release(pane)
+        print(f"herdr-sleeper: pane cwd is {os.getcwd()}, slept-in {entry['cwd']}; left as a shell.\n"
+              f"  manual: {manual_command(entry)}")
+        return 0
+    argv = resume_argv(entry.get("kind") or "claude", uuid, entry.get("argv") or None)
+    if argv is None:
+        release(pane)
+        print(f"herdr-sleeper: no resume recipe for {entry.get('kind')}; manual: {manual_command(entry)}")
+        return 0
+    release(pane)
+    with locked():
+        journal = read_json(JOURNAL)
+        if journal.get(pane, {}).get("uuid") == uuid:
+            journal.pop(pane, None)
+            write_json(JOURNAL, journal)
+    event("woke", pane=pane, name=name, uuid=uuid, via="stub", slept_at=entry.get("slept_at"))
+    os.execvp(argv_kind_binary(entry.get("kind") or "claude"), [entry.get("kind") or "claude", *argv])
+    return 0  # unreachable in production: execvp replaces the process
+
+
+def argv_kind_binary(kind: str) -> str:
+    return kind  # agent binaries are on PATH by definition (herdr started them the same way)
+
+
+# ------------------------------------------------------------------- wake
+
+def wake_entry(entry: dict, via: str = "command") -> bool:
+    """Wake one journaled pane via `agent start`. Caller holds the lock; the entry is persisted."""
+    if not valid_entry(entry):
+        raise SleeperError(f"malformed journal entry: {json.dumps(entry)[:120]}")
+    pane = entry["pane_id"]
+    name = wake_name(entry)
+    uuid = entry["uuid"]
+    kind = entry["kind"]
+    if entry.get("phase") == "displaced":
+        say(f"cannot wake {name}: its pane now holds session {entry.get('wake_got')}; recover by hand: {manual_command(entry)}")
+        return False
+    extra: list[str] = []
+    if PROFILES.get(kind, {}).get("argv_after_binary"):
+        if entry.get("argv") is None:
+            say(f"cannot wake {name}: original argv unknown; refusing to invent one. Manual: {manual_command(entry)}")
+            return False
+        extra, why = replayable_argv(entry["argv"])
+        if extra is None:
+            say(f"cannot wake {name}: {why}; entry kept. Manual: {manual_command(entry)}")
+            return False
+    argv = resume_argv(kind, uuid, extra or None)
+    if argv is None:
+        say(f"cannot wake {name}: no resume recipe for {kind}; entry kept. Manual: {manual_command(entry)}")
+        return False
+    pane_info = herdr("pane", "get", pane, check=False).get("pane")
+    if not pane_info:
+        say(f"cannot wake {name}: pane {pane} no longer exists; entry kept. Manual: {manual_command(entry)}")
+        return False
+    if claimed(entry, pane_info):
+        release(pane)  # our own placeholder; the real checks below run on the shell left behind
+        pane_info = herdr("pane", "get", pane, check=False).get("pane") or {}
+    if "agent" in pane_info and pane_info.get("agent") != CLAIM_AGENT:
+        running = (pane_info.get("agent_session") or {}).get("value")
+        if running == uuid and agent_process(pane, kind)[0] is True:
+            say(f"{name}: session {uuid} is already running in {pane}; clearing journal entry")
+            journal = read_json(JOURNAL)
+            journal.pop(pane, None)
+            write_json(JOURNAL, journal)
+            return True
+        say(f"cannot wake {name}: pane {pane} still shows an agent (session {running}); entry kept")
+        return False
+    if agent_process(pane, kind)[0] is not False:
+        say(f"cannot wake {name}: cannot confirm pane {pane} is at a bare shell; entry kept")
+        return False
+    # pane identity: a recycled pane id must not silently wake into an unrelated shell
+    if entry.get("terminal_id") and pane_info.get("terminal_id") and entry["terminal_id"] != pane_info["terminal_id"]:
+        say(f"cannot wake {name}: pane {pane} is now terminal {pane_info['terminal_id']}, slept-in "
+            f"{entry['terminal_id']} (recycled pane id?); entry kept. Manual: {manual_command(entry)}")
+        event("wake-refused", pane=pane, name=name, uuid=uuid, reason="terminal_id mismatch")
+        return False
+    if entry.get("cwd") and pane_info.get("cwd") and pane_info["cwd"] != entry["cwd"]:
+        say(f"cannot wake {name}: pane {pane} now lives in {pane_info['cwd']}, journal says {entry['cwd']} "
+            f"(recycled pane id?); entry kept. Manual: {manual_command(entry)}")
+        event("wake-refused", pane=pane, name=name, uuid=uuid, reason="cwd mismatch")
+        return False
+    where = uuid_live_elsewhere(uuid, cwd=entry.get("cwd"))  # raises when it cannot tell
+    if where:
+        say(f"cannot wake {name}: session {uuid} is already live in {where}")
+        event("wake-refused", pane=pane, name=name, uuid=uuid, reason=f"live in {where}")
+        return False
+    if kind == "claude" and transcript_for(uuid) is None:
+        say(f"cannot wake {name}: transcript for {uuid} is gone; entry kept. Manual: {manual_command(entry)}")
+        return False
+    if stub_running(pane):
+        herdr("pane", "send-keys", pane, "enter", check=False)  # let the stub do the exec-wake
+        return True
+    cmd = ["agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", str(WAKE_TIMEOUT_MS),
+           "--", *argv]
+    try:
+        result = herdr(*cmd, timeout=WAKE_TIMEOUT_MS / 1000 + 30)
+    except SleeperError as exc:
+        say(f"wake {name} failed: {exc}; entry kept")
+        event("wake-failed", pane=pane, name=name, uuid=uuid, reason=str(exc))
+        return False
+    got = (result.get("agent", {}).get("agent_session") or {}).get("value")
+    journal = read_json(JOURNAL)
+    if got != uuid:
+        # a fresh session took the pane; keep the record so the old one stays reachable.
+        if pane in journal:
+            journal[pane].update(wake_failed_at=dt.datetime.now().isoformat(timespec="seconds"), wake_got=got)
+            write_json(JOURNAL, journal)
+        say(f"WARN {name}: pane now runs session {got}, expected {uuid}; entry kept. Manual: {manual_command(entry)}")
+        event("wake-mismatch", pane=pane, name=name, uuid=uuid, got=got)
+        return False
+    if entry.get("label"):
+        herdr("pane", "rename", pane, entry["label"], check=False)
+    elif pane_info.get("label"):
+        herdr("pane", "rename", pane, "--clear", check=False)  # bare `rename <pane>` is a usage error (verified)
+    journal.pop(pane, None)
+    write_json(JOURNAL, journal)
+    say(f"woke {name} in {pane} uuid={got} (via {via})")
+    event("woke", pane=pane, name=name, uuid=got, via=via, slept_at=entry.get("slept_at"))
+    return True
+
+
+def find_journal_entry(target: str) -> tuple[str, dict, bool] | None:
+    """The entry named by a pane id, wake name, or agent name: (pane, entry, from_snapshot)."""
+    journal = read_json(JOURNAL)
+    hits = [(p, e) for p, e in journal.items() if target in (p, wake_name(e), e.get("name"))]
+    if hits:
+        return hits[0][0], hits[0][1], False
+    snap = read_json(SNAPSHOT)
+    for p, s in snap.items():
+        if target in (p, s.get("name"), "wake-" + p.replace(":", "-")):
+            return p, {"pane_id": p, **s, "phase": "asleep", "slept_at": None,
+                       "label": None, "tab_id": None, "workspace_id": None}, True
+    return None
+
+
+def cmd_wake(args: argparse.Namespace) -> int:
+    with locked():
+        try:
+            journal = read_json(JOURNAL)
+        except DamagedState as exc:
+            if args.all:
+                raise
+            aside = quarantine(JOURNAL)  # keep the damaged bytes; recovery below writes a fresh journal
+            say(f"WARN {exc}; damaged journal moved to {aside}; continuing with snapshot recovery only")
+            journal = {}
+        if args.all:
+            targets = [e for e in journal.values() if e.get("phase") != "displaced"]
+            if not targets:
+                print("nothing is sleeping")
+                return 0
+        else:
+            try:
+                hit = find_journal_entry(args.target)
+            except DamagedState as exc:
+                aside = quarantine(JOURNAL)  # keep the damaged bytes; snapshot recovery writes a fresh journal
+                say(f"WARN {exc}; damaged journal moved to {aside}; continuing with snapshot recovery only")
+                hit = find_journal_entry(args.target)
+            if not hit:
+                print(f"no sleeping agent named {args.target!r}; try `herdr-sleeper list`")
+                return 1
+            if hit[2]:  # crash recovery: persist the recovered entry *before* trying, or a
+                journal = read_json(JOURNAL)  # mid-wake crash loses the only other copy of the handle
+                journal[hit[0]] = hit[1]
+                write_json(JOURNAL, journal)
+                print(f"recovering {hit[0]} from panes.json")
+            targets = [hit[1]]
+        woke = 0
+        for entry in targets:
+            try:
+                woke += wake_entry(entry, via="command")
+            except SleeperError as exc:
+                say(f"wake {wake_name(entry)}: {exc}")
+    print(f"woke {woke}/{len(targets)}")
+    return 0 if woke == len(targets) else 1
+
+
+# --------------------------------------------------------------- reconcile
+
+def reconcile(agents: list[dict]) -> None:
+    """Settle `exit-requested` entries, displaced sessions, and panes that moved."""
+    journal = read_json(JOURNAL)
+    by_pane = {a["pane_id"]: a for a in agents if a.get("agent")}  # a listed pane with no agent is not live
+    panes = {}
+    with contextlib.suppress(SleeperError):
+        panes = {p.get("pane_id"): p for p in herdr("pane", "list").get("panes", [])}
+    changed = False
+    for pane, entry in list(journal.items()):
+        live = by_pane.get(pane)
+        live_uuid = (live or {}).get("agent_session", {}).get("value") if live else None
+        if not valid_entry(entry):
+            say(f"reconcile {pane}: malformed journal entry left untouched")
+            continue
+        kind = entry["kind"]
+        confirmed_running = bool(live and live_uuid == entry["uuid"] and agent_process(pane, kind)[0] is True)
+        if not confirmed_running and entry.get("seen_running"):
+            entry.pop("seen_running")  # the streak must be consecutive; anything unconfirmed resets it
+            changed = True
+        if confirmed_running:
+            # seen running with a real process. Once could be Herdr lagging a slow exit; twice in a row is not.
+            seen = int(entry.get("seen_running", 0)) + 1
+            if seen < 2:
+                entry["seen_running"] = seen
+                changed = True
+                continue
+            say(f"reconcile {pane}: session {entry['uuid']} is running again (seen twice); dropping journal entry")
+            event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"], outcome="running")
+            journal.pop(pane)
+            changed = True
+        elif live and live_uuid and live_uuid != entry["uuid"] and entry.get("wake_got"):
+            if entry.get("phase") != "displaced":
+                entry["phase"] = "displaced"  # our own wake put another session here; keep the handle, by hand only
+                changed = True
+                say(f"reconcile {pane}: session {entry['uuid']} displaced by {live_uuid}; entry kept for manual "
+                    f"recovery: {manual_command(entry)}")
+        elif live and live_uuid and live_uuid != entry["uuid"]:
+            say(f"reconcile {pane}: now runs session {live_uuid}, not {entry['uuid']}; dropping journal entry")
+            event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"], outcome="replaced", by=live_uuid)
+            journal.pop(pane)
+            changed = True
+        elif entry.get("phase") == "exit-requested" and not live and agent_process(pane, kind)[0] is False:
+            entry["phase"] = "asleep"
+            entry.pop("seen_running", None)
+            event("reconciled", pane=pane, name=wake_name(entry), uuid=entry["uuid"], outcome="asleep")
+            changed = True
+        elif not live and entry.get("terminal_id"):
+            # pane gone or moved: follow a terminal that still exists under a new pane id, else keep the handle
+            moved = next((p for p, info in panes.items() if info.get("terminal_id") == entry["terminal_id"]
+                          and p != pane and p not in journal), None)
+            if moved:
+                journal[moved] = {**entry, "pane_id": moved}
+                journal.pop(pane)
+                changed = True
+                say(f"reconcile: {pane} moved to {moved} (terminal {entry['terminal_id']})")
+    if changed:
+        write_json(JOURNAL, journal)
+
+
+# ---------------------------------------------------------------- watcher
+
+def code_stamp() -> str:
+    st = SELF.stat()
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def watcher_pid_record() -> dict | None:
+    try:
+        data = json.loads(WATCHER_PID.read_text())
+        return data if isinstance(data, dict) and data.get("pid") else None
+    except (OSError, ValueError):
+        return None
+
+
+def process_matches(pid: int, needle: str) -> bool:
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=10).stdout
+        return needle in out
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def watcher_alive(rec: dict | None) -> bool:
+    if not rec:
+        return False
+    try:
+        os.kill(rec["pid"], 0)
+    except (OSError, TypeError):
+        return False
+    return process_matches(rec["pid"], "watch")
+
+
+def ensure_watcher() -> str:
+    cur = watcher_pid_record()
+    if cur and watcher_alive(cur):
+        if cur.get("stamp") == code_stamp():
+            return f"watcher already running (pid {cur['pid']})"
+        try:
+            os.kill(cur["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+        say(f"replacing watcher pid={cur['pid']} (plugin code changed)")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    child = subprocess.Popen([sys.executable, str(SELF), "watch"], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, env={**os.environ, "HERDR_BIN_PATH": HERDR_BIN})
+    WATCHER_PID.write_text(json.dumps({"pid": child.pid, "stamp": code_stamp()}))
+    return f"watcher spawned (pid {child.pid})"
+
+
+def watch_tick(idle_since: dict[str, float], last_seq: dict[str, object], config: dict) -> None:
+    """One pass over `agent list`: advance idle clocks, sleep what is due, reconcile the journal."""
+    agents = list_agents()
+    now = time.monotonic()
+    seen: set[str] = set()
+    exclude = set(config["exclude"])
+    with locked():
+        try:
+            merge_snapshot(agents)
+        except DamagedState as exc:
+            say(f"WARN {exc}; damaged snapshot moved to {quarantine(SNAPSHOT)}")
+        try:
+            reconcile(agents)
+            journal = read_json(JOURNAL)
+        except DamagedState as exc:
+            say(f"WARN {exc}; damaged journal moved to {quarantine(JOURNAL)}")
+            journal = {}
+        for agent in agents:
+            kind = agent.get("agent")
+            if kind not in config["agents"]:
+                continue
+            pane = agent["pane_id"]
+            seen.add(pane)
+            if exclude and (pane in exclude or agent.get("name") in exclude):
+                idle_since.pop(pane, None)
+                continue
+            seq = agent.get("state_change_seq")
+            seq_changed = pane in last_seq and last_seq[pane] != seq
+            last_seq[pane] = seq
+            # `done` = idle-but-unviewed: its clock must accrue too or background-finished panes never sleep
+            sleepable_state = agent.get("agent_status") in SLEEPABLE_STATUSES and agent.get("focused") is False
+            if not sleepable_state or seq_changed:
+                idle_since.pop(pane, None)
+                if not sleepable_state:
+                    continue
+            idle_since.setdefault(pane, now)
+            if now - idle_since[pane] < config["idle_hours"] * 3600:
+                continue
+            uuid = agent.get("agent_session", {}).get("value")  # capture before sleep mutates the pane
+            try:
+                did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=False,
+                                           idle_since=idle_since.get(pane), notify_enabled=config["notify"])
+            except SleeperError as exc:  # one flaky pane must not starve the rest of the tick
+                did, outcome = False, f"error: {exc}"
+            if did:
+                say(f"slept {pane} ({agent.get('name') or kind}) uuid={uuid}")
+                idle_since.pop(pane, None)
+            elif not outcome.startswith(("idle ", "excluded", "already", "status ", "agent kind")):
+                say(f"skip {pane}: {outcome}")
+    for pane in [p for p in idle_since if p not in seen]:
+        idle_since.pop(pane, None)
+        last_seq.pop(pane, None)
+
+
+def watch_loop() -> None:
+    claimed_rec = watcher_pid_record()
+    if not claimed_rec or claimed_rec["pid"] != os.getpid():
+        if claimed_rec and watcher_alive(claimed_rec):
+            print(f"watcher already running (pid {claimed_rec['pid']})")
+            return
+        WATCHER_PID.write_text(json.dumps({"pid": os.getpid(), "stamp": code_stamp()}))
+
+    def on_term(*_a: object) -> None:
+        say("watcher stopped (SIGTERM)")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    say(f"watcher start session={SESSION}")
+    idle_since: dict[str, float] = {}   # pane -> monotonic start of the current idle stretch
+    last_seq: dict[str, object] = {}    # pane -> state_change_seq seen last tick
+    failures = 0
+
+    while True:
+        if (watcher_pid_record() or {}).get("pid") != os.getpid():
+            say("watcher superseded; exiting")
+            return
+        try:
+            config, _src = load_config()
+            poll = max(1.0, float(config["poll_seconds"]))
+        except ConfigError as exc:
+            say(f"error: sleeping disabled by broken config — {exc}")
+            time.sleep(300)
+            continue
+        try:
+            watch_tick(idle_since, last_seq, config)
+            failures = 0
+        except SleeperError as exc:
+            failures += 1
+            if failures >= WATCHER_MAX_FAILURES:
+                say(f"herdr unreachable for {failures} ticks; exiting ({exc})")
+                return
+            say(f"tick-error: {exc}")
+        time.sleep(poll)
+
+
+# ------------------------------------------------------------- focus hook
+
+def wake_lock(pane: str):
+    """One click fires several pane.focused hooks (workspace→tab→pane); only the first may act.
+
+    Returns a release callable, or None when a recent holder is on this pane.
+    """
+    path = STATE_DIR / f".{pane.replace(':', '_')}.wakelock"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+
+            def release() -> None:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+
+            return release
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime < 120:  # agent start waits up to 60s; older is a dead holder
+                    return None
+                path.unlink()
+            except OSError:
+                return None
+    return None
+
+
+def cmd_on_focus() -> int:
+    if os.environ.get("HERDR_SLEEPER_WAKE_ON_FOCUS") == "0":
+        return 0
+    raw = os.environ.get("HERDR_PLUGIN_EVENT_JSON") or "{}"
+    try:
+        pane = ((json.loads(raw).get("data") or {}).get("pane_id")
+                or json.loads(raw).get("pane_id"))
+    except ValueError:
+        return 0
+    if not pane:
+        return 0
+    try:
+        if pane not in read_json(JOURNAL):
+            return 0  # cheap path for ordinary focus events: nothing of ours there
+    except (SleeperError, DamagedState):
+        return 0
+    try:
+        config, _src = load_config()
+        if not config["wake_on_focus"]:
+            return 0
+    except ConfigError:
+        return 0
+    release = wake_lock(pane)
+    if not release:
+        return 0
+    try:
+        with locked():
+            hit = find_journal_entry(pane)
+            if hit:
+                wake_entry(hit[1], via="focus")
+    except SleeperError as exc:
+        say(f"on-focus {pane}: {exc}")
+    finally:
+        release()
+    return 0
+
+
+# -------------------------------------------------------------- migration
+
+def migrate_legacy() -> None:
+    """One-time adoption of the standalone script's journal for this session."""
+    if SESSION != "default" or JOURNAL.exists():
+        return
+    legacy = LEGACY_STATE_DIR / "sleeping.json"
+    if not legacy.exists():
+        return
+    try:
+        data = json.loads(legacy.read_text())
+    except (OSError, ValueError):
+        say("migration: legacy journal unreadable; starting empty (the legacy file is untouched)")
+        return
+    if not isinstance(data, dict):
+        say("migration: legacy journal is not an object; starting empty (the legacy file is untouched)")
+        return
+    entries = {p: {**e, "kind": e.get("kind") or "claude"} for p, e in data.items()
+               if isinstance(e, dict) and isinstance(e.get("uuid"), str)}
+    if entries:
+        write_json(JOURNAL, entries)
+    event("migrated", entries=len(entries), source=str(legacy))
+    say(f"migrated {len(entries)} legacy journal entr{'y' if len(entries) == 1 else 'ies'} from {legacy}")
+
+
+# ------------------------------------------------------------------- CLI
+
+def cmd_startup() -> int:
+    migrate_legacy()
+    print(ensure_watcher())
+    return 0
+
+
+def context_pane() -> str | None:
+    try:
+        ctx = json.loads(os.environ.get("HERDR_PLUGIN_CONTEXT_JSON") or "{}")
+    except ValueError:
+        return None
+    return ctx.get("focused_pane_id") or ctx.get("pane_id") or os.environ.get("HERDR_PANE_ID")
+
+
+def cmd_sleep_pane(args: argparse.Namespace) -> int:
+    pane = args.pane or context_pane()
+    if not pane:
+        print("no pane context; pass a pane id", file=sys.stderr)
+        return 2
+    try:
+        config, _src = load_config()
+    except ConfigError as exc:
+        print(f"error: broken config — {exc}", file=sys.stderr)
+        return 2
+    agent = next((a for a in list_agents() if a["pane_id"] == pane), None)
+    if not agent or not agent.get("agent"):
+        print(f"{pane}: no agent to sleep", file=sys.stderr)
+        return 1
+    with locked():
+        try:
+            slept, outcome = sleep_agent(agent, config["idle_hours"], set(config["exclude"]),
+                                         dry_run=args.dry_run, allow_focused=True, notify_enabled=config["notify"])
+        except SleeperError as exc:
+            slept, outcome = False, f"error: {exc}"
+    print(f"{pane}: {outcome}" if not slept else f"slept {pane}: {outcome}")
+    return 0 if slept or args.dry_run else 1
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    """One watcher-style tick on demand (used by tests and by hand)."""
+    try:
+        config, _src = load_config()
+    except ConfigError as exc:
+        print(f"error: refusing to scan with a broken config — {exc}", file=sys.stderr)
+        return 2
+    exclude = set(config["exclude"]) | set(args.exclude or [])
+    rows = []
+    slept = 0
+    with locked():
+        agents = list_agents()
+        merge_snapshot(agents)
+        reconcile(agents)
+        journal = read_json(JOURNAL)
+        for agent in agents:
+            ok, reason, _idle = assess(agent, agents, config["idle_hours"], journal, exclude)
+            outcome = reason
+            if ok:
+                try:
+                    did, outcome = sleep_agent(agent, config["idle_hours"], exclude, dry_run=args.dry_run,
+                                               notify_enabled=config["notify"])
+                except SleeperError as exc:
+                    did, outcome = False, f"error: {exc}"
+                slept += did
+            rows.append({"pane": agent["pane_id"], "name": agent.get("name"),
+                         "status": agent.get("agent_status"), "eligible": ok, "outcome": outcome})
+    for r in rows:
+        mark = "SLEEP" if r["outcome"] == "slept" else "would" if r["outcome"].startswith("would") else "keep "
+        print(f"{mark} {r['pane']:8} {(r['name'] or '-'):20} {r['status'] or '-':8} {r['outcome']}")
+    print(f"{slept} slept, {len(rows)} inspected, idle window {config['idle_hours']:g}h"
+          + (" (dry run)" if args.dry_run else ""))
+    return 0
+
+
+def cmd_list(_args: argparse.Namespace) -> int:
+    try:
+        journal = read_json(JOURNAL)
+    except DamagedState as exc:
+        print(f"damaged journal: {exc}", file=sys.stderr)
+        return 2
+    if not journal:
+        print("nothing is sleeping")
+        return 0
+    for pane, e in sorted(journal.items()):
+        print(f"{wake_name(e):20} {pane:8} {e.get('kind', 'claude'):9} {e.get('phase', 'asleep'):15} "
+              f"slept {e.get('slept_at', '?'):20} {e.get('title') or ''}")
+    return 0
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    if not EVENTS.exists():
+        print("(no events yet)")
+        return 0
+    lines = EVENTS.read_text().splitlines()
+    for line in (lines[-args.tail:] if args.tail else lines):
+        print(line)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="herdr-sleeper", description="sleep idle Herdr agents; wake them later")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("startup", help="ensure the watcher (idempotent)").set_defaults(
+        fn=lambda _a: cmd_startup())
+    sp = sub.add_parser("sleep-pane", help="sleep the context pane (or PANE) now")
+    sp.add_argument("pane", nargs="?")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_sleep_pane)
+    wp = sub.add_parser("wake", help="wake one sleeping agent (pane id, wake name, or agent name)")
+    wp.add_argument("target", nargs="?")
+    wp.add_argument("--all", action="store_true")
+    wp.set_defaults(fn=cmd_wake)
+    sub.add_parser("wake-all", help="wake every sleeping agent").set_defaults(fn=lambda a: cmd_wake(
+        argparse.Namespace(target=None, all=True)))
+    sub.add_parser("list", help="what is sleeping").set_defaults(fn=cmd_list)
+    lp = sub.add_parser("log", help="events, newest last")
+    lp.add_argument("--tail", type=int, default=None)
+    lp.set_defaults(fn=cmd_log)
+    sub.add_parser("on-focus", help="pane.focused hook (internal)").set_defaults(fn=lambda a: cmd_on_focus())
+    sub.add_parser("watch", help="the idle watcher loop (internal)").set_defaults(fn=lambda a: watch_loop() or 0)
+    stp = sub.add_parser("stub", help="in-pane wake stub (internal)")
+    stp.add_argument("pane")
+    stp.add_argument("uuid")
+    stp.add_argument("state_dir", nargs="?", default=None)
+    stp.set_defaults(fn=lambda a: cmd_stub(a.pane, a.uuid, a.state_dir))
+    scp = sub.add_parser("scan", help="one tick on demand")
+    scp.add_argument("--dry-run", action="store_true")
+    scp.add_argument("--exclude", action="append")
+    scp.set_defaults(fn=cmd_scan)
+    args = p.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SleeperError as exc:
+        say(f"error: {exc}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
