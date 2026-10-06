@@ -43,16 +43,32 @@ pane label with 💤, and posts a notification with the freed MB.
 Wake paths:
 
 1. **Focus the pane** — the `pane.focused` hook wakes it (disable with
-   `wake_on_focus = false`).
-2. **Press Enter in the pane** — the wake stub execs the agent back into
-   its session after the same fail-closed checks.
+   `wake_on_focus = false`). When the pane's stub does it, the hook waits
+   (outside the global lock) until the session is up, then finishes the
+   record and hands the agent its name back.
+2. **Press Enter in the pane** — a bare Enter: the wake stub execs the agent
+   back into its session after the same fail-closed checks and restores the
+   pane label; the next watcher tick hands the agent its name back once the
+   session is seen running. A typed line is not a wake request (an
+   orchestrator's `pane run` must not be eaten): the stub echoes it as
+   ignored and keeps waiting.
 3. **Command** — `herdr plugin action invoke djbclark.herdr-sleeper.wake`
-   with the pane focused, or `wake-all` / `list` / `log` from anywhere.
+   wakes the context pane (only that pane), or `wake-all` / `list` / `log`
+   from anywhere. When the pane's stub does the wake, `wake` waits up to
+   30 s for the session to come back before reporting success (a stub that
+   exec'd but whose session Herdr has not reported yet counts as started).
 
 The idle clock is `state_change_seq` movement from the watcher's polling of
 `agent list` (default 60 s) — no transcript mtime, no launchd, and the
 clock restarts on any state change between polls. `done` (idle-but-unviewed)
-accrues like `idle`.
+accrues like `idle`, and a pane slept while `done` shows
+`claude · sleeping · done`. Clocks persist in `idle.json` (wall clock), keyed
+pane + terminal id + `state_change_seq` + session, so a watcher restart
+keeps them; a Herdr restart, a damaged file, or any mismatch starts the
+clock again (a later sleep, never an earlier one). Resets reach the file
+before the tick sleeps anything. `scan` honours the same clocks (an
+unclocked pane's stretch starts now), so it no longer sleeps everything at
+once.
 
 Supported kinds: **claude** (original argv replayed on wake) and
 **opencode** (`-s <session>`). Codex is deliberately absent — see the
@@ -68,14 +84,24 @@ herdr plugin action invoke djbclark.herdr-sleeper.wake-all
 herdr plugin action invoke djbclark.herdr-sleeper.log
 ```
 
-Config: `<plugin config dir>/config.toml` — `idle` (duration), `agents`
-(list), `exclude` (panes or names), `poll_seconds`, `notify`,
-`wake_on_focus`; overridable by `HERDR_SLEEPER_*` env, lowest to highest
-precedence. State: `<plugin state dir>/` per Herdr session — `sleeping.json`
-journal, `panes.json` crash-recovery snapshot, `events.jsonl`, `sleeper.log`,
-`watcher.pid`. A legacy standalone-script journal
-(`~/.local/state/herdr-sleeper/`) is adopted once, on the default session's
-first startup.
+Config: `<plugin config dir>/config.toml` — Herdr's
+`~/.config/herdr/plugins/config/djbclark.herdr-sleeper/config.toml` (run
+`herdr plugin list` to see it) — `idle` (duration), `agents` (list),
+`exclude` (panes or names), `poll_seconds`, `notify`, `wake_on_focus`;
+overridable by `HERDR_SLEEPER_*` env (booleans take true/false/1/0), lowest
+to highest precedence. State: `<plugin state dir>/` per Herdr session —
+`sleeping.json` journal, `panes.json` crash-recovery snapshot, `idle.json`
+idle clocks, `events.jsonl`, `sleeper.log`, `watcher.pid`/`watcher.lock`.
+A legacy standalone-script journal (`~/.local/state/herdr-sleeper/`) is
+adopted once, on the default session's first startup. An older config —
+v0.1.0's manual-run location
+`~/.config/herdr/plugins/djbclark.herdr-sleeper/config.toml` or the
+standalone `~/.config/herdr-sleeper/config.toml` — is translated once when
+the plugin config is missing (`interval_minutes` dropped); when the plugin
+config already exists it is never rewritten, and startup logs that the
+older file is not read. An older config that cannot be translated keeps
+sleeping off, and so does a plugin config with no `exclude` while an older
+file still has one (merge it, or set `exclude = []`).
 
 Keybindings work like any plugin action:
 
@@ -115,30 +141,71 @@ introduces are marked.
    only). A record is never deleted because its pane vanished; the manual
    resume command is printed instead. A pane that moved (new pane id, same
    `terminal_id`) is followed.
-4. Wake refuses if the session id is live in any pane or any process that
-   selects it, when that cannot be verified, or when the pane's cwd or
-   `terminal_id` no longer matches the record (recycled pane id). *Delta:*
+4. *v0.1.1:* pane identity. Herdr re-allocates every terminal id when it
+   restores a session and re-applies the saved manual label, so a changed
+   `terminal_id` on a pane that still carries our 💤 label is a restart,
+   not reuse: same pane id + 💤 label + a bare shell wakes, and the new
+   terminal id is recorded only with a wake that succeeded. cwd is not
+   identity evidence (workspace ids restart at max(restored)+1, so a fresh
+   pane can get a recycled pane id in the same cwd — but never our label);
+   a restored pane `cd`'d elsewhere is refused with "cd back". A new
+   terminal without the label, or one running another session, is a reused
+   pane id: the record is re-keyed `orphan:<first 8 of uuid>` with phase
+   `orphaned` (one `orphaned` event), never woken automatically (focus,
+   `wake-all` and `wake <orphan key or name>` refuse it, by key), and
+   `list` prints its manual resume line. A legacy record with no terminal
+   id needs the label as well. A record is dropped only when the *same*
+   terminal now runs a different session (a deliberate replacement). The
+   crash-recovery snapshot keeps an orphan copy the same way.
+5. Wake refuses if the session id is live in any pane or any process that
+   selects it (our own stub is recognised by its argv structure, never by
+   substring), when that cannot be verified, when an `exit-requested`
+   agent is still there (reconcile's two-sighting rule decides, not one
+   focus), or when the same terminal moved to another cwd. *Delta:*
    focus-wakes are debounced by a per-pane lock (one click fires several
-   `pane.focused` hooks); the in-pane stub runs the same checks before it
-   execs, and refuses when the shell's cwd no longer matches the record.
-5. A non-object state file, malformed config, unknown keys, booleans where
+   `pane.focused` hooks) and give up after 10 s on a busy global lock (the
+   next focus retries; a pane running another session is skipped silently);
+   the in-pane stub resolves the agent binary and checks the transcript
+   first, runs the replay filter and the liveness check again under the
+   lock, and then marks the record `waking` with its pid rather than popping
+   it (exec keeps the pid). Every other wake path refuses a `waking` record
+   whose pid is alive; the watcher finishes it once the session runs, or
+   puts it back to `asleep` (and re-claims the row) if the pid died; ctrl-c
+   or a failed exec puts it back at once. An empty process list from Herdr
+   is "unknown", never "no stub". A taken agent name is retried once as
+   `wake-<pane>`; a start that answers before the session id is known is
+   confirmed from `pane get`, never logged as a mismatch. `sleep-pane`
+   refuses a pane whose record is kept for another session.
+6. A non-object state file, malformed config, unknown keys, booleans where
    numbers go, conflicting env aliases, or a `nan`/negative/`inf` window
    disables sleeping (logged every tick) — `wake`/`list`/`log` keep
    working, and damaged state files are quarantined to
    `*.damaged-<timestamp>`, never overwritten. A file lock serialises
    overlapping runs; the journal is re-read under it before every write.
+   On Python < 3.11 the config is read by a strict TOML subset parser that
+   refuses (rather than misreads) anything tomllib would read differently.
+7. *v0.1.1:* the watcher never gives up. Any exception costs one tick and
+   backs off (poll × 2ⁿ, at most 10 min); one watcher per state dir, held
+   by `watcher.lock`; SIGTERM (code change) finishes the transaction in hand
+   first; `list`, `scan`, `sleep-pane` and every focus hook respawn a
+   missing watcher, or replace a pre-v0.1.1 one that holds no lock (without
+   inheriting the caller's `HERDR_SLEEPER_*` overrides). A recorded watcher
+   pid is trusted only when its argv is `… herdr-sleeper watch` and, for a
+   v0.1.1 record, it holds `watcher.lock`. One failing pane costs that pane,
+   not the tick.
 
 Known limits: SIGTERM leaves a small window between the final recheck and
 the process handling it (only a native Herdr operation could close it);
-the stub's typed text path consumes anything typed into a slept pane
-before Enter.
+the stub line is POSIX shell (`printf`, `env`), so nushell/pwsh panes get
+focus/command wakes only.
 
 ## Tests
 
-`python3 -m pytest tests/ -q` — 77 tests: the decision logic, the
-sleep/wake state machine, the watcher tick's idle clock, the focus hook,
-the stub, and legacy migration, against a fake `herdr`. Verified on
-Python 3.9 (Apple's `/usr/bin/python3`) and 3.14.
+`python3 -m pytest tests/ -q` — 156 tests: the decision logic, the
+sleep/wake state machine, pane identity and orphans, the watcher tick and
+loop (idle clocks, backoff, the watcher lock), the focus hook, the stub,
+the 3.9 TOML subset parser, and legacy migration, against a fake `herdr`.
+Verified on Python 3.9 (Apple's `/usr/bin/python3`) and 3.14.
 
 ## Credits
 
