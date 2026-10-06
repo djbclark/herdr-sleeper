@@ -14,6 +14,12 @@ argv replay filter, session-live checks, and config validation are ours and
 carried over from the standalone script's three review rounds plus its
 live-deployment iteration.
 
+Building something similar, for Herdr or another multiplexer?
+[LESSONS.md](LESSONS.md) collects the non-obvious traps we hit: pane and
+session identity across restarts, the plugin runtime, typing into panes, idle
+clocks, watcher lifecycle and testing against a real server. Each comes with
+evidence. It is written to be useful whether or not you use this plugin.
+
 ## Install
 
 ```bash
