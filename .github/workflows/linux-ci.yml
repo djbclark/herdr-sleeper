@@ -1,0 +1,28 @@
+name: Linux CI
+
+# Overlay-only workflow, lives on the orphan ci/base branch (docs/ci-github.md).
+# scripts/github-ci-run overlays this file onto a target commit and pushes
+# ci/run/<slug>, which is the only thing that fires this workflow.
+
+on:
+  push:
+    branches: ['ci/run/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: python -m pip install pytest
+      - name: Run tests
+        run: python -m pytest tests -q
