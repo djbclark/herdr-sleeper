@@ -223,3 +223,20 @@ Verified on Python 3.9 (Apple's `/usr/bin/python3`) and 3.14.
   in-pane Enter stub, `notification show`, freed-MB reporting.
 - [`scripts/herdr-sleeper`](https://github.com/djbclark/herdr/tree/herdr-sleeper/scripts/herdr-sleeper)
   (the standalone ancestor) — everything fail-closed.
+
+
+## Upstream Herdr artifacts
+
+1. [Discussion 631](https://github.com/herdrdev/herdr/discussions/631) — agent sleep / hibernate design thread (plugin announcement and follow-ups).
+2. Standalone ancestor script on the fork: [`scripts/herdr-sleeper`](https://github.com/djbclark/herdr/tree/herdr-sleeper/scripts/herdr-sleeper).
+
+
+## Related djbclark Herdr repos
+
+| Repo | Role |
+| --- | --- |
+| [djbclark/herdr](https://github.com/djbclark/herdr) | Fork of [herdrdev/herdr](https://github.com/herdrdev/herdr) |
+| [herdr-plain-line](https://github.com/djbclark/herdr-plain-line) | Local plugin: plain-English popup for tab/workspace rename and create |
+| [herdr-sleeper](https://github.com/djbclark/herdr-sleeper) | Plugin: sleep idle agent panes, wake later |
+| [herdr4paseo](https://github.com/djbclark/herdr4paseo) | Terminal UI to watch/steer a Paseo agent from a pane |
+| [paseo4herdr](https://github.com/djbclark/paseo4herdr) | Paseo plugin mirroring OMP agents that run in Herdr |
