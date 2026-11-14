@@ -2,7 +2,7 @@
 
 A Herdr plugin that sleeps idle agent panes after a user-chosen window and
 wakes them — on focus, by pressing Enter in the pane, or by command. It is
-the standalone [`scripts/herdr-sleeper`](https://github.com/djbclark/herdr/tree/herdr-sleeper/scripts/herdr-sleeper)
+the standalone [`scripts/herdr-sleeper`](https://github.com/frdminc/herdr/tree/herdr-sleeper/scripts/herdr-sleeper)
 reference implementation reborn as a plugin: the fail-closed safety rules
 are unchanged, and the plugin adds what only a plugin can do (an in-process
 idle watcher, wake-on-focus, a sidebar placeholder for slept panes,
@@ -23,7 +23,7 @@ evidence. It is written to be useful whether or not you use this plugin.
 ## Install
 
 ```bash
-herdr plugin install djbclark/herdr-sleeper
+herdr plugin install frdminc/herdr-sleeper
 ```
 
 Requires Herdr ≥ 0.9.1 on macOS or Linux, and Python 3.9 or newer on the
@@ -33,7 +33,7 @@ parsing falls back to a built-in TOML subset below Python 3.11).
 For local development:
 
 ```bash
-git clone https://github.com/djbclark/herdr-sleeper
+git clone https://github.com/frdminc/herdr-sleeper
 herdr plugin link <checkout>
 ```
 
@@ -221,22 +221,22 @@ Verified on Python 3.9 (Apple's `/usr/bin/python3`) and 3.14.
   `agent_name_taken` handling ideas.
 - `prabhatgmp/herdr-park` — the sidebar claim (`pane report-agent`), the
   in-pane Enter stub, `notification show`, freed-MB reporting.
-- [`scripts/herdr-sleeper`](https://github.com/djbclark/herdr/tree/herdr-sleeper/scripts/herdr-sleeper)
+- [`scripts/herdr-sleeper`](https://github.com/frdminc/herdr/tree/herdr-sleeper/scripts/herdr-sleeper)
   (the standalone ancestor) — everything fail-closed.
 
 
 ## Upstream Herdr artifacts
 
 1. [Discussion 631](https://github.com/herdrdev/herdr/discussions/631) — agent sleep / hibernate design thread (plugin announcement and follow-ups).
-2. Standalone ancestor script on the fork: [`scripts/herdr-sleeper`](https://github.com/djbclark/herdr/tree/herdr-sleeper/scripts/herdr-sleeper).
+2. Standalone ancestor script on the fork: [`scripts/herdr-sleeper`](https://github.com/frdminc/herdr/tree/herdr-sleeper/scripts/herdr-sleeper).
 
 
 ## Related djbclark Herdr repos
 
 | Repo | Role |
 | --- | --- |
-| [djbclark/herdr](https://github.com/djbclark/herdr) | Fork of [herdrdev/herdr](https://github.com/herdrdev/herdr) |
-| [herdr-plain-line](https://github.com/djbclark/herdr-plain-line) | Local plugin: plain-English popup for tab/workspace rename and create |
-| [herdr-sleeper](https://github.com/djbclark/herdr-sleeper) | Plugin: sleep idle agent panes, wake later |
-| [herdr4paseo](https://github.com/djbclark/herdr4paseo) | Terminal UI to watch/steer a Paseo agent from a pane |
+| [frdminc/herdr](https://github.com/frdminc/herdr) | Fork of [herdrdev/herdr](https://github.com/herdrdev/herdr) |
+| [herdr-plain-line](https://github.com/frdminc/herdr-plain-line) | Local plugin: plain-English popup for tab/workspace rename and create |
+| [herdr-sleeper](https://github.com/frdminc/herdr-sleeper) | Plugin: sleep idle agent panes, wake later |
+| [herdr4paseo](https://github.com/frdminc/herdr4paseo) | Terminal UI to watch/steer a Paseo agent from a pane |
 | [paseo4herdr](https://github.com/djbclark/paseo4herdr) | Paseo plugin mirroring OMP agents that run in Herdr |
